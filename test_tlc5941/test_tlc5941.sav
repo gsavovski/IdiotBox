@@ -1,0 +1,1017 @@
+//*****************************************************************************
+//
+// test_tlc5941.c - Test application to setup and try the TLC5941 PWM LED
+//                  driver chip.
+//
+// Copyright (c) 2013 Idiotronics Incorporated.  All rights reserved.
+// 
+// This is part of revision 1.0 of the Idiotbox Firmware Package.
+//
+//*****************************************************************************
+
+//*****************************************************************************
+//
+// This program will set up the TLC5941 PWM LED driver chip. The chip is set
+// up with SPI port writes to set the Dot Correction values and the Grayscale
+// values. Then the grayscale clock will be set up. A Grayscale PWM cycle is
+// 4096 clocks. Every 4096 clocks an interrupt will toggle the blank line
+// which will start the Grayscale cycle over again.
+//
+// This program uses the following peripherals and I/O signals:
+// - SSI1 peripheral
+// - SSI1Clk - PD0
+// - SSI1Tx  - PD3
+// - TIMER0 peripheral
+// - T0CCP1  - PF1
+// - GPIO port A
+// - MODE    - PA5
+// - XLAT    - PA6
+// - BLANK   - PA7
+// - TIMER1 peripheral (interrupt)
+//
+// The following UART signals are configured only for displaying console
+// messages for this program.
+// - UART0 peripheral
+// - GPIO Port A peripheral (for UART0 pins)
+// - UART0RX - PA0
+// - UART0TX - PA1
+//
+// This program uses the following interrupt handlers:
+// - Timer1IntHandler
+//
+//*****************************************************************************
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "inc/hw_ints.h"
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+#include "inc/hw_gpio.h"
+#include "inc/hw_ssi.h"
+#include "driverlib/debug.h"
+#include "driverlib/fpu.h"
+#include "driverlib/gpio.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/pin_map.h"
+#include "driverlib/rom.h"
+#include "driverlib/ssi.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/timer.h"
+#include "driverlib/uart.h"
+#include "driverlib/udma.h"
+#include "utils/uartstdio.h"
+
+#define GPIO_PIN_ALL (0xFF)
+
+//*****************************************************************************
+//
+// The number of 40MHz clock ticks in a grayscale cycle. 80000 sets the
+// cycle time to 2ms.
+//
+//*****************************************************************************
+// Display one matrix row every 2ms. Whole display will be swept every 16ms.
+#define GRAYSCALE_CYCLE 80000
+
+//*****************************************************************************
+//
+// The number of 40MHz clock ticks in a PWMDAC period. 2500 sets the
+// cycle time to 0.05ms or sampling frequency of 16kHz.
+//
+//*****************************************************************************
+#define PWMDAC_PERIOD 2500
+
+//*****************************************************************************
+//
+// TLC5941 serial port state machine states.
+//
+//*****************************************************************************
+#define SSI_IDLE    0
+#define SSI_OUTPUT1 1
+#define SSI_OUTPUT2 2
+#define SSI_OUTPUT3 3
+#define SSI_OUTPUT4 4
+#define SSI_OUTPUT5 5
+#define SSI_OUTPUT6 6
+#define SSI_OUTPUT7 7
+#define SSI_OUTPUT8 8
+#define SSI_OUTPUT9 9
+
+
+//*****************************************************************************
+//
+// Globals
+//
+//*****************************************************************************
+
+// font table for ASCII values 32 to 127.
+extern char font8x8_basic[128-32][8];
+
+// Bit indicating an new grayscale cycle should begin
+volatile uint32_t g_NewGSCycle;
+
+// Pointer to PWMDAC waveform table
+volatile uint32_t g_pwmDacPtr;
+
+// The PWM chip allows for intensity values at a resolution of 1/4096 full scale.
+// Full scale is 4096.
+// This array holds values for the 8 RED LEDs followed by the 8 GREEN LEDs followed
+// by the 8 BLUE LEDs.
+volatile uint32_t g_gsValues[2*32];
+volatile uint32_t g_gsIdx;
+
+// LED row cyles from 0 to 7 as each LED row is refreshed
+volatile uint32_t g_ledRow[2];
+
+// gsValues and ledRow are double buffered. These are indices to the double buffers.
+volatile uint32_t buffHalf;
+
+// State value for TLC5941 serial port writes
+volatile uint32_t g_ssiState;
+
+//*****************************************************************************
+//
+// Data buffers
+//
+//*****************************************************************************
+
+//
+// Bit maps for big heart and little heart
+//
+static char heartMap[2][8] = {
+  { 0x00, 0x36, 0x49, 0x41, 0x41, 0x22, 0x14, 0x08},   // Big heart
+  { 0x00, 0x00, 0x36, 0x2A, 0x22, 0x14, 0x08, 0x00}    // Little heart
+};
+
+//
+// Bit map for a circle
+//
+static char circle[1][8] = {
+  { 0x3C, 0x42, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3C}   // circle
+};
+
+//
+// Pixel index table for tracing a circle
+//
+#define CIRCLE_PATT_LEN 20
+static char circlePatt[CIRCLE_PATT_LEN] = {
+   2,  3,  4,  5, 14, 23, 31, 39, 47, 54,
+  61, 60, 59, 58, 49, 40, 32, 24, 16,  9
+};
+
+
+//
+// Array of RBG colors
+//
+#define NUM_COLORS 2
+static uint32_t colors[NUM_COLORS] = {
+  0x2480F0, // yellow
+  0x0000FF  // red
+};
+
+//
+// Table to map keypad codes to ASCII charaters
+//
+static char keyCodeMap[16] = {
+  '1', '2', '3', 'A',
+  '4', '5', '6', 'B',
+  '7', '8', '9', 'C',
+  '*', '0', '#', 'D'
+};
+
+//
+// Table to get different trace frequencies for pattern tracing
+static uint32_t traceFreqMap[16] = {
+  // 120, 91, 70, 53,
+  //  40, 31, 23, 18,
+  //  14, 10, 8, 6,
+  //   5,  3, 3, 2
+  129, 113, 98, 84,
+   71,  69, 58, 48,
+   39,  31, 24, 18,
+  13,   9,  6,  4 // 4 is really too fast. 6 is OK
+};
+
+// Table to convert LED row value to GPIO pin number
+static uint32_t ledRowPin[8] = {
+   GPIO_PIN_2,
+   GPIO_PIN_3,
+   GPIO_PIN_5,
+   GPIO_PIN_0,
+   GPIO_PIN_1,
+   GPIO_PIN_4,
+   GPIO_PIN_7,
+   GPIO_PIN_6};
+
+// Waveform table for PWM DAC
+#define PWMDAC_TABLE_LEN 16
+static uint32_t pwmDacTable[PWMDAC_TABLE_LEN] = {
+  0.5*PWMDAC_PERIOD, (0.5+0.45*0.383)*PWMDAC_PERIOD, (0.5+0.45*0.707)*PWMDAC_PERIOD, (0.5+0.45*0.924)*PWMDAC_PERIOD,
+  (0.5+0.45)*PWMDAC_PERIOD, (0.5+0.45*0.924)*PWMDAC_PERIOD, (0.5+0.45*0.707)*PWMDAC_PERIOD, (0.5+0.45*0.383)*PWMDAC_PERIOD,
+  0.5*PWMDAC_PERIOD, (0.5-0.45*0.383)*PWMDAC_PERIOD, (0.5-0.45*0.707)*PWMDAC_PERIOD, (0.5-0.45*0.924)*PWMDAC_PERIOD,
+  (0.5-0.45)*PWMDAC_PERIOD, (0.5-0.45*0.924)*PWMDAC_PERIOD, (0.5-0.45*0.707)*PWMDAC_PERIOD, (0.5-0.45*0.383)*PWMDAC_PERIOD
+};
+
+//*****************************************************************************
+//
+// The interrupt handler for Grayscale cycle interrupt.
+//
+//*****************************************************************************
+void
+Timer1IntHandler(void)
+{
+    //
+    // Clear the timer interrupt.
+    //
+    ROM_TimerIntClear(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
+
+    //
+    // Raise BLANK high.
+    // Activate the next LED row.
+    // Pulse XLAT to clock in grayscale data and row driver data.
+    // Set BLANK low again to start the next grayscale cycle.
+    //
+
+    // BLANK high
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_7, GPIO_PIN_7);
+    // Delay about 3 clocks
+    SysCtlDelay(1);
+
+    // XLAT high
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, GPIO_PIN_6);
+    // Delay about 9 clocks
+    SysCtlDelay(3);
+
+    // XLAT low
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0);
+    // Delay about 3 clocks
+    SysCtlDelay(1);
+
+    // BLANK low
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_7, 0);
+    // Delay about 3 clocks
+    SysCtlDelay(1);
+
+    g_ssiState = SSI_OUTPUT1;
+
+}
+
+//*****************************************************************************
+//
+// The interrupt handler for PWM DAC interrupt.
+// This is a 16kHz interrupt for playing out DAC samples.
+// There is also a state machine for clocking out SSI data to the TLC5941
+// 4 words at a time.
+//
+//*****************************************************************************
+void
+WTimer3IntHandler(void)
+{
+  uint32_t regValue;
+
+    //
+    // Clear the timer interrupt.
+    //
+    ROM_TimerIntClear(WTIMER3_BASE, TIMER_CAPA_EVENT);
+
+    //
+    // Write a new match event value from the table.
+    //
+    g_pwmDacPtr = (g_pwmDacPtr + 1 >= PWMDAC_TABLE_LEN) ? 0 : g_pwmDacPtr + 1;
+    regValue = pwmDacTable[g_pwmDacPtr];
+    TimerMatchSet(WTIMER3_BASE, TIMER_A, regValue);
+
+    //
+    // Increment index of double buffer of grayscale data and
+    // Output 1 word of grayscale data to SSI port
+    //
+    g_gsIdx = 0x1F & (g_gsIdx+1);
+    HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[g_gsIdx];
+
+    switch (g_ssiState) {
+    case SSI_OUTPUT1: 
+      // 4 zeros to fill out unused outputs OUT15-12.
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      g_ssiState = SSI_OUTPUT2;
+      // Set buffer half to be used by the interrupt to output grayscale data
+      // Background will work on the other half.
+      buffHalf = buffHalf ? 0 : 1;
+      ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_ALL, ledRowPin[g_ledRow[buffHalf]]);
+      g_gsOffs = buffHalf ? 24 : 0;
+      g_NewGSCycle = 1;
+      break;
+    case SSI_OUTPUT2:
+      // 4 RED values for OUT11-8
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[0+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[1+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[2+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[3+g_gsOffs];
+      g_ssiState = SSI_OUTPUT3;
+      break;
+    case SSI_OUTPUT3:
+      // 4 RED values for OUT7-4
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[4+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[5+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[6+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[7+g_gsOffs];
+      g_ssiState = SSI_OUTPUT4;
+      break;
+    case SSI_OUTPUT4:
+      // 4 BLUE values for OUT3-0
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[16+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[17+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[18+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[19+g_gsOffs];
+      g_ssiState = SSI_OUTPUT5;
+      break;
+    case SSI_OUTPUT5:
+      // 4 zeros to fill out unused outputs OUT15-12.
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      HWREG(SSI1_BASE + SSI_O_DR) = 0;
+      g_ssiState = SSI_OUTPUT6;
+      break;
+    case SSI_OUTPUT6:
+      // 4 GREEN values for OUT11-8
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[8+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[9+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[10+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[11+g_gsOffs];
+      g_ssiState = SSI_OUTPUT7;
+      break;
+    case SSI_OUTPUT7:
+      // 4 GREEN values for OUT7-4
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[12+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[13+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[14+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[15+g_gsOffs];
+      g_ssiState = SSI_OUTPUT8;
+      break;
+    case SSI_OUTPUT8:
+      // 4 BLUE values for OUT3-0
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[20+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[21+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[22+g_gsOffs];
+      HWREG(SSI1_BASE + SSI_O_DR) = g_gsValues[23+g_gsOffs];
+      g_ssiState = SSI_OUTPUT9;
+      break;
+    case SSI_OUTPUT9:
+      g_ssiState = SSI_IDLE;
+      // Move double buffer pointer
+      break;
+    case SSI_IDLE:
+    default:
+      break;
+    }
+}
+
+//*****************************************************************************
+//
+// Configure the SSI port and its pins.
+//
+//*****************************************************************************
+void
+ConfigureSSI(void)
+{
+    //
+    // The SSI1 peripheral must be enabled for use.
+    //
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI1);
+
+    //
+    //
+    // Configure the pin muxing for SSI1 functions on port D0 and D3.
+    //
+    ROM_GPIOPinConfigure(GPIO_PD0_SSI1CLK);
+    ROM_GPIOPinConfigure(GPIO_PD3_SSI1TX);
+
+    //
+    // Configure the GPIO settings for the SSI pins.  This function also gives
+    // control of these pins to the SSI hardware. Only clock and data out are used.
+    // The pins are assigned as follows:
+    //      PD3 - SSI1Tx
+    //      PD0 - SSI1CLK
+    //
+    ROM_GPIOPinTypeSSI(GPIO_PORTD_BASE, GPIO_PIN_3 | GPIO_PIN_2 | GPIO_PIN_1 |
+                   GPIO_PIN_0);
+
+    //
+    // Configure and enable the SSI port for SPI master mode.  Use SSI1,
+    // system clock supply, idle clock level low and active low clock in
+    // freescale SPI mode, master mode, 1MHz SSI frequency, and 12-bit data.
+    //
+    ROM_SSIConfigSetExpClk(SSI1_BASE, SysCtlClockGet(), SSI_FRF_MOTO_MODE_0,
+                           SSI_MODE_MASTER, 1000000, 12);
+
+    //
+    // Enable the SSI1 module.
+    //
+    ROM_SSIEnable(SSI1_BASE);
+
+}
+
+//*****************************************************************************
+//
+// Configure the LED row driver.
+//
+//*****************************************************************************
+void
+ConfigureRowDriver(void)
+{
+    //
+    // Enable the GPIO pins for LED row driver (PB0 - PB7).
+    // Enable the ~CLR pin (PF4)
+    //
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | \
+                              GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7);
+    // Turn all rows off
+    ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | \
+                     GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7, 0);
+
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_4);
+    // Keep LED row driver off
+    ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_4, 0);
+
+}
+
+//*****************************************************************************
+//
+// Configure the UART and its pins.  This must be called before UARTprintf().
+//
+//*****************************************************************************
+void
+ConfigureUART(void)
+{
+    //
+    // Enable UART0
+    //
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
+
+    //
+    // Configure GPIO Pins for UART mode.
+    //
+    ROM_GPIOPinConfigure(GPIO_PA0_U0RX);
+    ROM_GPIOPinConfigure(GPIO_PA1_U0TX);
+    ROM_GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+
+    //
+    // Use the internal 16MHz oscillator as the UART clock source.
+    //
+    UARTClockSourceSet(UART0_BASE, UART_CLOCK_PIOSC);
+
+    //
+    // Initialize the UART for console I/O.
+    //
+    UARTStdioConfig(0, 115200, 16000000);
+}
+
+//*****************************************************************************
+//
+// Configure TIMER1 to interrupt every 4096 grayscale clocks
+//
+//*****************************************************************************
+void
+ConfigureGSINT(void)
+{
+    uint32_t regValue;
+
+    //
+    // Enable Timer1
+    //
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER1);
+
+    //
+    // Configure the 32-bit periodic timer.
+    //
+    regValue = GRAYSCALE_CYCLE;
+    ROM_TimerConfigure(TIMER1_BASE, TIMER_CFG_PERIODIC);
+    ROM_TimerLoadSet(TIMER1_BASE, TIMER_A, regValue);
+
+    //
+    // Setup the interrupts for the timer timeouts.
+    // Priority should be less than PWM DAC interrupt
+    //
+    IntEnable(INT_TIMER1A);
+    ROM_IntPrioritySet(INT_TIMER1A, 0x01);
+    ROM_TimerIntEnable(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
+
+    //
+    // Enable the timer.
+    //
+    ROM_TimerEnable(TIMER1_BASE, TIMER_A);
+}
+
+//*****************************************************************************
+//
+// Configure TIMER0 to output grayscale clock
+//
+//*****************************************************************************
+void
+ConfigureGSCLK(void)
+{
+    uint32_t regValue;
+
+    //
+    // Set PF2 and PF3 to inputs. This will allow the GREEN LED
+    // and BLUE LED to be usedfor debug.
+    //
+    GPIOPinTypeGPIOInput(GPIO_PORTF_BASE, GPIO_PIN_2 | GPIO_PIN_3);
+
+    //
+    // Enable the GPIO pin PF1 for T0CCP1. This is also the RED LED pin.
+    //
+    ROM_GPIOPinConfigure(GPIO_PF1_T0CCP1);
+    ROM_GPIOPinTypeTimer(GPIO_PORTF_BASE, GPIO_PIN_1);
+
+    //
+    // Enable Timer0
+    //
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+
+    //
+    // Set the global timer configuration for 16-bit split pair.
+    //
+    ROM_TimerConfigure(TIMER0_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_B_PWM);
+
+    //
+    // Configure TIMER0B for PWM operation, period = GRAYSCALE_CYCLE / 4096
+    //
+    regValue = GRAYSCALE_CYCLE / 4096;
+    ROM_TimerLoadSet(TIMER0_BASE, TIMER_B, regValue);
+    ROM_TimerPrescaleSet(TIMER0_BASE, TIMER_B, 0);
+    //
+    // Configure TIMER0B for  50% duty
+    //
+    regValue = GRAYSCALE_CYCLE / 8192;
+    TimerMatchSet(TIMER0_BASE, TIMER_B, regValue);
+    TimerPrescaleMatchSet(TIMER0_BASE, TIMER_B, 0);
+    //
+    // Enable the timer.
+    //
+    ROM_TimerEnable(TIMER0_BASE, TIMER_B);
+}
+
+//*****************************************************************************
+//
+// Configure PWM DAC using Wide Timer3, WT3CCP0 on pin PD2
+//
+//*****************************************************************************
+void
+ConfigurePWMDAC(void)
+{
+    uint32_t regValue;
+
+    //
+    // Enable the GPIO pin PD2 for WT3CCP0.
+    //
+    ROM_GPIOPinConfigure(GPIO_PD2_WT3CCP0);
+    ROM_GPIOPinTypeTimer(GPIO_PORTD_BASE, GPIO_PIN_2);
+
+    //
+    // Enable Wide Timer3
+    //
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_WTIMER3);
+
+    //
+    // Set the global timer configuration for 16-bit split pair.
+    //
+    ROM_TimerConfigure(WTIMER3_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_PWM);
+
+    //
+    // Configure WTIMER3A for PWM operation, period = GRAYSCALE_CYCLE / 4096
+    //
+    ROM_TimerLoadSet(WTIMER3_BASE, TIMER_A, PWMDAC_PERIOD);
+    ROM_TimerPrescaleSet(WTIMER3_BASE, TIMER_A, 0);
+
+    //
+    // Configure WTIMER3A duty cycle for 1st entry in waveform table
+    //
+    g_pwmDacPtr = 0;
+    regValue = pwmDacTable[g_pwmDacPtr];
+    TimerMatchSet(WTIMER3_BASE, TIMER_A, regValue);
+    TimerPrescaleMatchSet(WTIMER3_BASE, TIMER_A, 0);
+    //
+    // Configure WTIMER3A to interrupt on negative edge of PWM signal
+    //
+    TimerControlEvent(WTIMER3_BASE, TIMER_A, TIMER_EVENT_NEG_EDGE);
+    IntEnable(INT_WTIMER3A);
+    ROM_TimerIntEnable(WTIMER3_BASE, TIMER_CAPA_EVENT);
+
+    //
+    // Enable the timer.
+    //
+    ROM_TimerEnable(WTIMER3_BASE, TIMER_A);
+}
+
+//*****************************************************************************
+//
+// Configure PC4, PC5, PD6 and PD7 for keypad scanning
+//
+//*****************************************************************************
+void
+ConfigureKeybdScan(void)
+{
+    //
+    // Unlock commit bit for PD7
+    //
+    HWREG(GPIO_PORTD_BASE + GPIO_O_LOCK) = GPIO_LOCK_KEY;
+    HWREG(GPIO_PORTD_BASE + GPIO_O_CR) |= 0x80;
+    HWREG(GPIO_PORTD_BASE + GPIO_O_LOCK) = 0;
+
+    //
+    // Set PC4, PC5, PD6 and PD7 to GPIO inputs
+    //
+    GPIODirModeSet(GPIO_PORTC_BASE, GPIO_PIN_4 | GPIO_PIN_5, GPIO_DIR_MODE_IN);
+    GPIODirModeSet(GPIO_PORTD_BASE, GPIO_PIN_6 | GPIO_PIN_7, GPIO_DIR_MODE_IN);
+
+    //
+    // Set the pads for push-pull operation with weak pull-down.
+    //
+    GPIOPadConfigSet(GPIO_PORTC_BASE, GPIO_PIN_4 | GPIO_PIN_5, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD);
+    GPIOPadConfigSet(GPIO_PORTD_BASE, GPIO_PIN_6 | GPIO_PIN_7, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD);
+}
+
+//*****************************************************************************
+//
+// Write dot correction data.
+//
+//*****************************************************************************
+void
+WriteDotCorrection(void)
+{
+    uint32_t ticks;
+
+    //
+    // Set mode high for Dot Correction write
+    //
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_5, GPIO_PIN_5);
+    // Delay about 3 clocks
+    SysCtlDelay(1);
+
+    //
+    // Each of the 16 outputs can have its LED on current set separately.
+    // This is done by writing 16 6-bit words, MSB first. Since the serial
+    // port is set for 12-bit data, these values are output 2 at a time.
+    // A 6-bit word, N, sets the output current to Imax * N/63.
+    // We only use 12 outputs per chip to distribute power dissipation.
+    // Set values of OUT0 to OUT11 to 001000b to set current to 1/8 max.
+    // OUT12 - OUT15 will be set to 0.
+    // Write 2 packed words of 0s and 6 packed words of 0x208.
+    //
+
+    // Write values for 1st TLC5941 in daisy-chain
+    ROM_SSIDataPut(SSI1_BASE, 0);
+    ROM_SSIDataPut(SSI1_BASE, 0);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    // Write values for 2nd TLC5941 in daisy-chain
+    ROM_SSIDataPut(SSI1_BASE, 0);
+    ROM_SSIDataPut(SSI1_BASE, 0);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+    ROM_SSIDataPut(SSI1_BASE, 0x208);
+
+    //
+    // Wait until SSI1 is done transferring all the data in the transmit FIFO.
+    //
+    while(ROM_SSIBusy(SSI1_BASE))
+    {
+    }
+    // Wait 10us to make sure serial data transfer is done
+    ticks = (SysCtlClockGet() / 3) / 100000;
+    SysCtlDelay(ticks);
+
+    //
+    // Pulse XLAT (PA6) high, then low. Minimum high is 20ns. With max of 80MHz clock
+    // that's only 2 clock cycles high. Setup from SCLK low to XLAT high is only 10ns.
+    //
+
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, GPIO_PIN_6);
+    // Delay about 3 clocks
+    SysCtlDelay(1);
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0);
+
+}
+      
+//*****************************************************************************
+//
+// RenderCharacter
+//
+//*****************************************************************************
+void
+RenderCharacter(char charAddr, char fontTable[128-32][8], uint32_t row, uint32_t color, \
+                uint32_t* gsValues)
+{
+    // Given a character, a 8x8 matrix row, a 8x8 font table and RGB values,
+    // construct grayscale values for the red, green and blue LEDs in given row.
+
+  char bitmap;
+  uint32_t idx;
+
+  bitmap = fontTable[charAddr][row];
+  for (idx = 0; idx < 8; idx++)
+  {
+    gsValues[idx] = (bitmap & (1 << idx)) ? ((color&0xFF) << 4) : 0;
+    gsValues[idx+8] = (bitmap & (1 << idx)) ? ((color&0xFF00) >> 4) : 0;
+    gsValues[idx+16] = (bitmap & (1 << idx)) ? ((color&0xFF0000) >> 12) : 0;
+  }
+}
+
+//*****************************************************************************
+//
+// RenderPixel
+//
+//*****************************************************************************
+void
+RenderPixel(uint32_t pixelIdx, uint32_t row, uint32_t color, uint32_t* gsValues)
+{
+  // Turn on the one pixel indicated by pixelIdx
+
+  uint32_t idx;
+  uint32_t match;
+
+  for (idx = 0; idx < 8; idx++)
+  {
+    match = ((pixelIdx >> 3) & 0x7) == row && (pixelIdx & 0x7) == idx;
+    gsValues[idx] = match ? ((color&0xFF) << 4) : 0;
+    gsValues[idx+8] = match ? ((color&0xFF00) >> 4) : 0;
+    gsValues[idx+16] = match ? ((color&0xFF0000) >> 12) : 0;
+  }
+}
+
+//*****************************************************************************
+//
+// KeybdRead
+//
+//*****************************************************************************
+uint32_t
+KeybdRead(uint32_t ledRow)
+{
+  uint32_t keyCode, keyCol;
+  
+    //
+    // If LED row is 2, 3, 4, or 5, check for keyboard input
+    //
+    keyCode = 0;
+    if (ledRow >= 2 && ledRow <= 5)
+    {
+      // Bits 0 and 1 of keyCode is ledRow-2
+      keyCode = ledRow - 2;
+
+      // Read inputs coming from column of keypad
+      keyCol = ROM_GPIOPinRead(GPIO_PORTC_BASE, GPIO_PIN_4 | GPIO_PIN_5);
+      keyCol |= ROM_GPIOPinRead(GPIO_PORTD_BASE, GPIO_PIN_6 | GPIO_PIN_7);
+      // Do priority encode to set keyCode bits 2 and 3
+      if (keyCol & GPIO_PIN_7)
+      {
+        keyCode |= 12;
+      }
+      else if (keyCol & GPIO_PIN_6)
+      {
+        keyCode |= 8;
+      }
+      else if (keyCol & GPIO_PIN_5)
+      {
+        keyCode |= 4;
+      }
+      // Set bit 4 if any key at all was pressed.
+      if (keyCol)
+      {
+        keyCode |= 16;
+      }
+    }
+    return(keyCode);
+}
+
+//*****************************************************************************
+//
+// main
+//
+//*****************************************************************************
+int
+main(void)
+{
+  uint32_t idx;
+  uint32_t idleCount;
+  //char displayChar;
+  uint32_t gsCycleCount;
+  uint32_t keyCode;
+  uint32_t pixelIdx, pattIdx;
+  uint32_t freqIdx;
+  uint32_t gsOffs;
+
+
+    //
+    // Enable lazy stacking for interrupt handlers.  This allows floating-point
+    // instructions to be used within interrupt handlers, but at the expense of
+    // extra stack usage.
+    //
+    ROM_FPULazyStackingEnable();
+
+    //
+    // Set the system clock to run at 40Mhz off PLL with external crystal as
+    // reference.
+    //
+    ROM_SysCtlClockSet(SYSCTL_SYSDIV_5 | SYSCTL_USE_PLL | SYSCTL_XTAL_16MHZ |
+                       SYSCTL_OSC_MAIN);
+
+    ROM_IntMasterDisable();
+
+    /*********************
+     * ENABLE GPIO PORTS *
+     *********************/
+
+    //
+    // Enable the GPIO port A used by the UART and TLC5941 controls.
+    // Enable the GPIO port B used to select an LED row.
+    // Enable the GPIO port C used to select keyboard column.
+    // Enable the GPIO port D used by SSI port and to select keyboard column.
+    // Enable the GPIO port F used by GSCLK and to enable LED row driver.
+    //
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
+    ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+
+    //
+    // Set up the serial console to use for displaying messages.
+    //
+    ConfigureUART();
+
+    //
+    // Enable the GPIO pins for TLC5941 control (PA5 - PA7).
+    //
+    ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7);
+
+    //
+    // Set MODE high (PA5), set XLAT low (PA6) and set BLANK high (PA7).
+    //
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_5, GPIO_PIN_5);
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0);
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_7, GPIO_PIN_7);
+
+    UARTprintf("TLC5941 controls configured\n");
+
+    /************************
+     * SETUP LED ROW DRIVER *
+     ************************/
+
+    ConfigureRowDriver();
+    UARTprintf("Row driver configured\n");
+
+    /*******************************************
+     * SETUP SPI PORT TO WRITE DATA TO TLC5941 *
+     *******************************************/
+
+    ConfigureSSI();
+    UARTprintf("SSI configured\n");
+
+    /*******************************************
+     * SETUP PC4, PC5, PD6 and PD7 as inputs   *
+     *******************************************/
+
+    ConfigureKeybdScan();
+
+    /****************************************
+     * WRITE DOT CORRECTION DATA TO TLC5941 *
+     ****************************************/
+
+    WriteDotCorrection();
+    UARTprintf("Dot correction data written\n");
+
+    /*****************************
+     * WRITE PWM DATA TO TLC5941 *
+     *****************************/
+
+    // Initialize bit indicating new grayscale cycle
+    g_NewGSCycle = 0;
+    for (idx = 0; idx < 2*24; idx++)
+    {
+      g_gsValues[idx] = 0;
+    }
+    //
+    // Set mode low for PWM write
+    //
+    ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_5, 0);
+
+    // Enable LED row driver
+    ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_4, GPIO_PIN_4);
+    g_ledRow[0] = 0;
+    g_ledRow[1] = 0;
+    buffHalf = 0;
+    //ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_ALL, ledRowPin[g_ledRow]);
+
+    //
+    // Pulse XLAT (PA6) high, then low. Need minimum high of 100ns for the row driver clock.
+    // With max of 80MHz clock that's 8 clocks. Setup from SCLK low to XLAT high is only 10ns.
+    //
+    //ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, GPIO_PIN_6);
+    // Delay about 9 clocks
+    //SysCtlDelay(3);
+    //ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0);
+
+    /****************************************************
+     * SETUP GRAYSCALE INTERRUPT FOR 4096 GSCLK PERIODS *
+     ****************************************************/
+
+    ConfigureGSINT();
+    UARTprintf("Grayscale cycle interrupt configured\n");
+
+    /*************************
+     * SETUP GRAYSCALE CLOCK *
+     *************************/
+
+    ConfigureGSCLK();
+    UARTprintf("Grayscale clock configured\n");
+
+    //
+    // Set blank low to start up the PWM output.
+    //
+    //ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_7, 0);
+
+    /*****************************
+     * SETUP PWM DAC for speaker *
+     *****************************/
+
+    ConfigurePWMDAC();
+    g_ssiState = SSI_IDLE;
+    UARTprintf("PWM DAC configured\n");
+
+    //
+    // Enable processor interrupts.
+    //
+    ROM_IntMasterEnable();
+
+    //
+    // Loop while the grayscale cycle interrupt toggles blank to start
+    // a new grayscale cycle.
+    //
+    idleCount = 0;
+    //displayChar = 32;
+
+    freqIdx = 0;
+    gsCycleCount = traceFreqMap[freqIdx];
+    pattIdx = 0;
+    pixelIdx = circlePatt[pattIdx];
+    while(1)
+    {
+      if (g_NewGSCycle != 0)
+      {
+        // Dummy write to give TLC5941 an extra clock (any arbitrary number of clocks
+        // before writing the final 192 bits just shift out of the way).
+        //ROM_SSIDataPut(SSI1_BASE, 0);
+
+
+        // Set next LED row
+        g_ledRow[(buffHalf & 1) ^ 1] = 0x7 & (g_ledRow[buffHalf & 1] + 1);
+        gsOffs = buffHalf ? 0 : 24;
+        RenderPixel(pixelIdx, g_ledRow[(buffHalf & 1) ^ 1], colors[0], &g_gsValues[gsOffs]);
+        //RenderCharacter( 0, circle, g_ledRow, colors[0], g_gsValues);
+        //RenderCharacter((gsCycleCount&0x100) >> 8, HeartMap, g_ledRow, colors[1], g_gsValues);
+        //RenderCharacter(displayChar - ' ', font8x8_basic, g_ledRow, colors[0], g_gsValues);
+
+        // If Keypad pressed select corresponding display character
+        keyCode = KeybdRead(g_ledRow[buffHalf & 1]);
+        if (keyCode & 0x10)
+        {
+          // Select new display character
+          //displayChar = keyCodeMap[keyCode & 0xF];
+          freqIdx = keyCode & 0xF;
+        }
+
+        //
+        // Update the grayscale cycle count
+        //
+        if (gsCycleCount)
+        {
+          gsCycleCount--;
+        }
+
+        if (gsCycleCount == 0)
+        {
+          pattIdx = (pattIdx + 1 >= CIRCLE_PATT_LEN) ? 0 : pattIdx + 1;
+          pixelIdx = circlePatt[pattIdx];
+          gsCycleCount = traceFreqMap[freqIdx];
+        }
+
+        g_NewGSCycle = 0;
+        idleCount = 0;
+      }
+      else
+      {
+        idleCount++;
+      }
+    }
+
+}
