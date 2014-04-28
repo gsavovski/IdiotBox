@@ -3,12 +3,15 @@ IdiotBox
 Hobby Electronics project using Texas Instrument's Tiva™ C Evaluation Board
 -----------------------------------------------------------
 
+This project was kicked off by my father in law Kenneth Jones
+as a christmas present for 2 grand kids. All kudos go to him. 
+
 
 Description
 ---------------------------------------------
 
-This project was kicked off by Kenneth Jones as a christmas
-present for 2 grand kids. 
+Control color led display via numpad to display
+letter numbers and play dorky frequencys. 
 
 
 Setup Instructions
